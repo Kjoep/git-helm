@@ -1,4 +1,4 @@
-from flask import Flask, Response, request
+from flask import Flask, Response, request, send_file
 from repos.resolve import get_repo
 import yaml
 import re
@@ -27,7 +27,8 @@ def get_package(repo: str, package: str):
         return Response(status=404)
     name = matcher.group(1)
     version = matcher.group(2)
-    return Response(get_repo(repo, root, credentials(request)).fetch(name, version), content_type='application/tar+gzip')
+    return send_file(get_repo(repo, root, credentials(request)).fetch(name, version),
+              mimetype='application/tar+gzip')
 
 
 def as_yaml(dict, status=200, headers={}):

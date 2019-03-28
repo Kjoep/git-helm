@@ -1,3 +1,6 @@
+import io
+from _pygit2 import GIT_RESET_HARD
+
 from repos.repositories import Repository
 
 import json
@@ -5,11 +8,17 @@ import tempfile
 import re
 import hashlib
 import tarfile
+import yaml
 
 from pygit2 import Repository as GitRepo, clone_repository
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+semver_pattern = re.compile(r'^((0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*))(?:-(0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)'
+                            r'(\.(0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$')
+semver_pattern_grp_prerelease = 5
+semver_pattern_grp_version = 1
+semver_pattern_grp_meta = 8
 
 def _version_from_branch(repo: GitRepo, reference: str, short_hash: str):
     try:
@@ -23,7 +32,7 @@ def _version_from_branch(repo: GitRepo, reference: str, short_hash: str):
 
 def _version_from_tag(self, reference: str, short_hash: str):
     version = reference.split('/tags/')[-1]
-    return version, f'{version}-{short_hash}'
+    return version, f'{version}+{short_hash}'
 
 
 def _sha256(filename: str):
@@ -50,7 +59,7 @@ class GitRepository(Repository):
         with tempfile.TemporaryDirectory() as workdir:
 
             print(f'cloning ${self.url}')
-            repo: Repository = clone_repository(self.url, workdir)
+            repo: GitRepo = clone_repository(self.url, workdir)
 
             chart_defs = [self._chart_def(repo, workdir, ref) for ref in repo.references]
             chart_defs = [d for d in chart_defs if d]
@@ -59,6 +68,15 @@ class GitRepository(Repository):
                 "apiVersion": "v1",
                 "entries": self._by_name(chart_defs)
             }
+
+    def fetch(self, name, version):
+        semver = semver_pattern.match(version)
+        if not semver:
+            raise ValueError
+        if semver.group(semver_pattern_grp_prerelease):
+            return self._fetch_commit(semver.group(semver_pattern_grp_prerelease))
+        else:
+            return self._fetch_commit(semver.group(semver_pattern_grp_version))
 
     def _chart_def(self, repo: GitRepo, workdir: str, reference: str):
         if 'refs/remotes/origin/' in reference:
@@ -81,24 +99,48 @@ class GitRepository(Repository):
 
         digest = _sha256(self._create_helm_package(workdir, version, long_version))
 
+        repo.reset(long_hash, GIT_RESET_HARD)
+
         return {
             "apiVersion": "v1",
             "created": ts,
             "description": self.name,
             "digest": digest,
             "name": self.name,
-            "sources": self.safe_url,
+            "sources": [self.safe_url],
             "urls": [
-                f"https://{self.credentials}{self.app_root}/{self.path}/{reference}/{long_version}.tgz"
+                f"https://{self.credentials}{self.app_root}/{self.path}/"
+                f"charts/{self.name.replace('/', '%20')}-{long_version}.tgz"
             ],
             "version": f'{long_version}',
             "appVersion": long_hash
         }
 
+    def _fetch_commit(self, hash):
+        with tempfile.TemporaryDirectory() as workdir:
+
+            print(f'cloning ${self.url}')
+            repo: GitRepo = clone_repository(self.url, workdir)
+
+            commit = repo.revparse_single(hash)
+            repo.checkout_tree(commit)
+            filename = self._create_helm_package(workdir, hash, str(commit.id))
+            with open(filename, 'rb') as content:
+                return io.BytesIO(content.read())
+
     def _create_helm_package(self, workdir: str, version: str, long_version: str):
-        # todo:
+        chart_details = yaml.load(open(f'{workdir}/helm/Chart.yaml', 'r'))
+        chart_details['version'] = version
+        chart_details['appVersion'] = long_version
+        yaml.dump(chart_details, open(f'{workdir}/helm/Chart.yaml', 'w'))
+
+        values_details = yaml.load(open(f'{workdir}/helm/values.yaml', 'r'))
+        values_details['image']['tag'] = version
+        yaml.dump(values_details, open(f'{workdir}/helm/values.yaml', 'w'))
+
         with tarfile.open('/tmp/helm.tgz', 'w:gz') as tar:
             tar.add(f'{workdir}/helm')
+
         return '/tmp/helm.tgz'
 
     def _by_name(self, defs: [str]):
